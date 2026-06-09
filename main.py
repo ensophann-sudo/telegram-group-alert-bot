@@ -152,12 +152,12 @@ async def setme(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please use /setme in private chat.")
         return
     set_config("personal_chat_id", str(chat.id))
-    await update.message.reply_text("Done! You will receive alerts and daily Excel reports at 5 PM Cambodia time.")
+    await update.message.reply_text("Done! You will receive alerts and weekly Excel reports every Thursday at 3 PM Cambodia time.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     personal_chat_id = get_config("personal_chat_id")
     today_rows = get_today_messages()
-    text = f"Bot Status\n\nChat ID saved: {'Yes' if personal_chat_id else 'No'}\nMessages today: {len(today_rows)}"
+    text = f"Bot Status\n\nChat ID saved: {'Yes' if personal_chat_id else 'No'}\nMessages today: {len(today_rows)}\nWeekly report: Every Thursday at 3 PM"
     await update.message.reply_text(text)
 
 async def sendnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -198,18 +198,19 @@ async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TY
         for part in split_long_text(alert_text):
             await context.bot.send_message(chat_id=personal_chat_id, text=part)
 
-async def send_daily_excel(context: ContextTypes.DEFAULT_TYPE):
+async def send_weekly_excel(context: ContextTypes.DEFAULT_TYPE):
     personal_chat_id = get_config("personal_chat_id")
     if not personal_chat_id:
+        print("No personal chat ID saved. Please send /setme to the bot.")
         return
     rows = get_today_messages()
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     if not rows:
-        await context.bot.send_message(chat_id=personal_chat_id, text=f"No messages today: {today}")
+        await context.bot.send_message(chat_id=personal_chat_id, text=f"No messages this week: {today}")
         return
     file_name = create_excel_file(rows)
     with open(file_name, "rb") as f:
-        await context.bot.send_document(chat_id=personal_chat_id, document=f, caption=f"Daily report: {today}")
+        await context.bot.send_document(chat_id=personal_chat_id, document=f, caption=f"Weekly report: {today}")
 
 def main():
     if not BOT_TOKEN:
@@ -223,8 +224,9 @@ def main():
     app.add_handler(CommandHandler("sendnow", sendnow))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.PHOTO) & ~filters.COMMAND, collect_group_message))
-    app.job_queue.run_daily(send_daily_excel, time=time(hour=17, minute=0, tzinfo=TIMEZONE), name="daily_excel_5pm")
+    app.job_queue.run_daily(send_weekly_excel, time=time(hour=15, minute=0, tzinfo=TIMEZONE), days=(3,), name="weekly_excel_thursday_3pm")
     print("Bot is running...")
+    print("Weekly Excel report will be sent every Thursday at 3 PM Cambodia time")
     app.run_polling()
 
 if __name__ == "__main__":
