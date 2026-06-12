@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import html
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from openpyxl import Workbook
@@ -15,6 +15,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 
 # =========================
 # CONFIG
@@ -43,7 +44,6 @@ def init_db():
         message_text TEXT,
         has_photo TEXT,
         message_id TEXT,
-        message_link TEXT,
         date_text TEXT,
         time_text TEXT,
         created_at TEXT
@@ -55,6 +55,43 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )
+    """)
+
+    # Add missing columns if your old database has different structure
+    cur.execute("PRAGMA table_info(messages)")
+    existing_columns = [col[1] for col in cur.fetchall()]
+
+    required_columns = {
+        "group_id": "TEXT",
+        "group_name": "TEXT",
+        "sender_name": "TEXT",
+        "sender_username": "TEXT",
+        "message_text": "TEXT",
+        "has_photo": "TEXT",
+        "message_id": "TEXT",
+        "date_text": "TEXT",
+        "time_text": "TEXT",
+        "created_at": "TEXT"
+    }
+
+    for column_name, column_type in required_columns.items():
+        if column_name not in existing_columns:
+            cur.execute(f"ALTER TABLE messages ADD COLUMN {column_name} {column_type}")
+
+    # Remove duplicate saved messages if any
+    cur.execute("""
+    DELETE FROM messages
+    WHERE id NOT IN (
+        SELECT MIN(id)
+        FROM messages
+        GROUP BY group_id, message_id
+    )
+    """)
+
+    # Prevent duplicate message saving
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_group_message
+    ON messages (group_id, message_id)
     """)
 
     conn.commit()
@@ -94,7 +131,6 @@ def save_message(
     message_text,
     has_photo,
     message_id,
-    message_link,
     date_text,
     time_text,
     created_at
@@ -103,7 +139,7 @@ def save_message(
     cur = conn.cursor()
 
     cur.execute("""
-    INSERT INTO messages (
+    INSERT OR IGNORE INTO messages (
         group_id,
         group_name,
         sender_name,
@@ -111,12 +147,11 @@ def save_message(
         message_text,
         has_photo,
         message_id,
-        message_link,
         date_text,
         time_text,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         group_id,
         group_name,
@@ -125,7 +160,6 @@ def save_message(
         message_text,
         has_photo,
         message_id,
-        message_link,
         date_text,
         time_text,
         created_at
@@ -136,105 +170,135 @@ def save_message(
 
 
 # =========================
-# REPORT DATA
+# REPORT PERIOD
 # =========================
 
-def get_unsent_grouped_messages():
+def get_latest_thursday_3pm(now=None):
     """
-    Get all messages after last_report_at.
-    If last_report_at does not exist, get all saved messages.
-    Group by:
-    - group_id
-    - sender_name
-    - sender_username
-    - date_text
-    - time_text
+    Return the latest Thursday 3:00 PM before or equal to now.
 
-    This means messages/photos sent in the same HH:MM:SS become one Excel row.
+    Example:
+    Friday 10 AM       -> yesterday Thursday 3 PM
+    Wednesday 10 AM    -> previous Thursday 3 PM
+    Thursday 2 PM      -> previous Thursday 3 PM
+    Thursday 4 PM      -> today Thursday 3 PM
     """
 
-    last_report_at = get_config("last_report_at")
+    if now is None:
+        now = datetime.now(TIMEZONE)
+
+    # Monday = 0, Tuesday = 1, Wednesday = 2, Thursday = 3
+    days_since_thursday = (now.weekday() - 3) % 7
+
+    thursday_date = now.date() - timedelta(days=days_since_thursday)
+
+    thursday_3pm = datetime.combine(
+        thursday_date,
+        time(hour=15, minute=0),
+        tzinfo=TIMEZONE
+    )
+
+    if now < thursday_3pm:
+        thursday_3pm -= timedelta(days=7)
+
+    return thursday_3pm
+
+
+def get_sendnow_period(now=None):
+    """
+    /sendnow period:
+    latest Thursday 3 PM until now.
+    """
+
+    if now is None:
+        now = datetime.now(TIMEZONE)
+
+    start_datetime = get_latest_thursday_3pm(now)
+    end_datetime = now
+
+    return start_datetime, end_datetime
+
+
+def get_weekly_auto_period(now=None):
+    """
+    Automatic Thursday 3 PM report period:
+    previous Thursday 3 PM until now.
+    """
+
+    if now is None:
+        now = datetime.now(TIMEZONE)
+
+    end_datetime = now
+    start_datetime = get_latest_thursday_3pm(now) - timedelta(days=7)
+
+    return start_datetime, end_datetime
+
+
+# =========================
+# GET REPORT DATA
+# =========================
+
+def get_grouped_messages_between(start_datetime, end_datetime):
+    """
+    Get report rows between start_datetime and end_datetime.
+
+    Group condition:
+    Same group + same sender + same username + same date + same HH:MM:SS
+    will show only one Excel row.
+
+    Excel output:
+    Name Group | Name Sender | Username | All Text | Photo | Photo Qty
+    """
+
+    start_iso = start_datetime.isoformat()
+    end_iso = end_datetime.isoformat()
 
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
-    if last_report_at:
-        cur.execute("""
-        SELECT
-            group_name,
-            sender_name,
-            sender_username,
+    cur.execute("""
+    SELECT
+        group_name AS name_group,
+        sender_name AS name_sender,
+        sender_username AS username,
 
-            COALESCE(
-                GROUP_CONCAT(
-                    CASE
-                        WHEN message_text IS NOT NULL
-                             AND TRIM(message_text) != ''
-                        THEN message_text
-                    END,
-                    CHAR(10)
-                ),
-                ''
-            ) AS all_text,
+        COALESCE(
+            GROUP_CONCAT(
+                CASE
+                    WHEN message_text IS NOT NULL
+                         AND TRIM(message_text) != ''
+                    THEN message_text
+                END,
+                CHAR(10)
+            ),
+            ''
+        ) AS all_text,
 
-            CASE
-                WHEN SUM(CASE WHEN has_photo = 'Yes' THEN 1 ELSE 0 END) > 0
-                THEN 'Yes'
-                ELSE 'No'
-            END AS photo,
+        CASE
+            WHEN SUM(CASE WHEN has_photo = 'Yes' THEN 1 ELSE 0 END) > 0
+            THEN 'Yes'
+            ELSE 'No'
+        END AS photo,
 
-            SUM(CASE WHEN has_photo = 'Yes' THEN 1 ELSE 0 END) AS photo_qty,
+        COALESCE(
+            SUM(CASE WHEN has_photo = 'Yes' THEN 1 ELSE 0 END),
+            0
+        ) AS photo_qty
 
-            MAX(created_at) AS max_created_at
+    FROM messages
+    WHERE created_at >= ?
+      AND created_at <= ?
 
-        FROM messages
-        WHERE created_at > ?
-        GROUP BY
-            group_id,
-            sender_name,
-            sender_username,
-            date_text,
-            time_text
-        ORDER BY MIN(created_at) ASC
-        """, (last_report_at,))
-    else:
-        cur.execute("""
-        SELECT
-            group_name,
-            sender_name,
-            sender_username,
+    GROUP BY
+        group_id,
+        sender_name,
+        sender_username,
+        date_text,
+        time_text
 
-            COALESCE(
-                GROUP_CONCAT(
-                    CASE
-                        WHEN message_text IS NOT NULL
-                             AND TRIM(message_text) != ''
-                        THEN message_text
-                    END,
-                    CHAR(10)
-                ),
-                ''
-            ) AS all_text,
-
-            CASE
-                WHEN SUM(CASE WHEN has_photo = 'Yes' THEN 1 ELSE 0 END) > 0
-                THEN 'Yes'
-                ELSE 'No'
-            END AS photo,
-
-            SUM(CASE WHEN has_photo = 'Yes' THEN 1 ELSE 0 END) AS photo_qty,
-
-            MAX(created_at) AS max_created_at
-
-        FROM messages
-        GROUP BY
-            group_id,
-            sender_name,
-            sender_username,
-            date_text,
-            time_text
-        ORDER BY MIN(created_at) ASC
-        """)
+    ORDER BY
+        MIN(created_at) ASC
+    """, (start_iso, end_iso))
 
     rows = cur.fetchall()
     conn.close()
@@ -242,21 +306,8 @@ def get_unsent_grouped_messages():
     return rows
 
 
-def update_last_report_at(rows):
-    """
-    Save the latest created_at from reported rows.
-    Next report will only include data after this time.
-    """
-
-    if not rows:
-        return
-
-    max_created_at = max(row[6] for row in rows if row[6])
-    set_config("last_report_at", max_created_at)
-
-
 # =========================
-# EXCEL
+# EXCEL FILE
 # =========================
 
 def create_excel_file(rows, report_type="report"):
@@ -293,10 +344,7 @@ def create_excel_file(rows, report_type="report"):
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     for row in rows:
-        # row has 7 fields.
-        # The last field is max_created_at.
-        # Excel only needs first 6 fields.
-        ws.append(row[:6])
+        ws.append(row)
 
     for row in ws.iter_rows():
         for cell in row:
@@ -313,47 +361,10 @@ def create_excel_file(rows, report_type="report"):
         ws.column_dimensions[column_letter].width = min(max_length + 2, 70)
 
     ws.freeze_panes = "A2"
+
     wb.save(file_name)
 
     return file_name
-
-
-# =========================
-# HELPERS
-# =========================
-
-def build_message_link(chat, message_id):
-    try:
-        if chat.username:
-            return f"https://t.me/{chat.username}/{message_id}"
-
-        chat_id = str(chat.id)
-
-        if chat_id.startswith("-100"):
-            internal_id = chat_id.replace("-100", "")
-            return f"https://t.me/c/{internal_id}/{message_id}"
-
-        return ""
-    except Exception:
-        return ""
-
-
-def split_long_text(text, max_length=3900):
-    parts = []
-
-    while len(text) > max_length:
-        split_at = text.rfind("\n", 0, max_length)
-
-        if split_at == -1:
-            split_at = max_length
-
-        parts.append(text[:split_at])
-        text = text[split_at:].strip()
-
-    if text:
-        parts.append(text)
-
-    return parts
 
 
 # =========================
@@ -367,93 +378,100 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Hello Sophann!\n\n"
             f"Your Chat ID: {chat.id}\n\n"
-            f"Send /setme to receive alerts and weekly Excel reports."
+            f"Use /setme to save this chat for automatic weekly Excel report.\n"
+            f"Use /sendnow to receive Excel from latest Thursday 3 PM until now.\n\n"
+            f"No group message alerts will be sent."
         )
     else:
-        await update.message.reply_text("Bot is active in this group.")
+        await update.message.reply_text(
+            "Bot is active in this group.\n"
+            "Group messages/photos will be saved silently."
+        )
 
 
 async def setme(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
     if chat.type != "private":
-        await update.message.reply_text("Please use /setme in private chat with the bot.")
+        await update.message.reply_text(
+            "Please use /setme in private chat with the bot."
+        )
         return
 
     set_config("personal_chat_id", str(chat.id))
 
     await update.message.reply_text(
         "Done!\n\n"
-        "You will receive alerts and Excel reports every Thursday at 3 PM Cambodia time."
+        "This chat will receive automatic Excel report every Thursday at 3 PM Cambodia time."
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     personal_chat_id = get_config("personal_chat_id")
-    last_report_at = get_config("last_report_at")
-    rows = get_unsent_grouped_messages()
+
+    now = datetime.now(TIMEZONE)
+    start_datetime, end_datetime = get_sendnow_period(now)
+
+    rows = get_grouped_messages_between(start_datetime, end_datetime)
 
     text = (
         "Bot Status\n\n"
         f"Chat ID saved: {'Yes' if personal_chat_id else 'No'}\n"
-        f"Unsent grouped rows: {len(rows)}\n"
-        f"Last report at: {last_report_at or 'Never'}\n"
-        "Weekly report: Every Thursday at 3 PM Cambodia time"
+        f"/sendnow From: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"/sendnow To: {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Rows ready: {len(rows)}\n\n"
+        "Automatic report: Every Thursday at 3 PM Cambodia time\n"
+        "Alert message: OFF"
     )
 
     await update.message.reply_text(text)
 
 
 async def sendnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = get_unsent_grouped_messages()
+    now = datetime.now(TIMEZONE)
+    start_datetime, end_datetime = get_sendnow_period(now)
+
+    rows = get_grouped_messages_between(start_datetime, end_datetime)
 
     if not rows:
-        await update.message.reply_text("No new messages since last report.")
+        await update.message.reply_text(
+            "No messages found.\n\n"
+            f"From: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"To: {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
         return
 
-    file_name = create_excel_file(rows, "manual")
+    file_name = create_excel_file(rows, report_type="manual")
 
-    with open(file_name, "rb") as f:
+    caption = (
+        "Telegram group messages report\n\n"
+        f"From: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"To: {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    with open(file_name, "rb") as file:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
-            document=f,
-            caption="Messages since last report"
+            document=file,
+            caption=caption
         )
-
-    update_last_report_at(rows)
-
-    await update.message.reply_text("Done. Last report time has been updated.")
-
-
-async def resetlast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Optional command.
-    Use this if you want next report to include all old data again.
-    """
-
-    set_config("last_report_at", "")
-
-    await update.message.reply_text(
-        "Done. Last report time has been reset.\n"
-        "Next /sendnow or weekly report will include all saved data."
-    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "/start - Show bot info\n"
-        "/setme - Save your private chat ID for alerts and weekly reports\n"
-        "/status - Check bot status\n"
-        "/sendnow - Send Excel now with all new data since last report\n"
-        "/resetlast - Reset last report time\n"
-        "/help - Show help"
+        "/start - Show bot information\n"
+        "/setme - Save your private chat for automatic Thursday report\n"
+        "/status - Check report period and row count\n"
+        "/sendnow - Send Excel from latest Thursday 3 PM until now\n"
+        "/help - Show help\n\n"
+        "Note: Bot saves group messages silently. No alerts."
     )
 
     await update.message.reply_text(text)
 
 
 # =========================
-# COLLECT GROUP MESSAGE
+# COLLECT GROUP MESSAGES
 # =========================
 
 async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -464,7 +482,12 @@ async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat = update.effective_chat
     user = update.effective_user
-    now = datetime.now(TIMEZONE)
+
+    # Use real Telegram message time, converted to Cambodia time
+    if message.date:
+        message_datetime = message.date.astimezone(TIMEZONE)
+    else:
+        message_datetime = datetime.now(TIMEZONE)
 
     group_id = str(chat.id)
     group_name = html.unescape(chat.title or "Unknown")
@@ -478,49 +501,30 @@ async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TY
     has_photo = "Yes" if message.photo else "No"
 
     message_id = str(message.message_id)
-    message_link = build_message_link(chat, message.message_id)
 
-    date_text = now.strftime("%Y-%m-%d")
-    time_text = now.strftime("%H:%M:%S")
-    created_at = now.isoformat()
+    date_text = message_datetime.strftime("%Y-%m-%d")
+    time_text = message_datetime.strftime("%H:%M:%S")
+    created_at = message_datetime.isoformat()
 
     save_message(
-        group_id,
-        group_name,
-        sender_name,
-        sender_username,
-        message_text,
-        has_photo,
-        message_id,
-        message_link,
-        date_text,
-        time_text,
-        created_at
+        group_id=group_id,
+        group_name=group_name,
+        sender_name=sender_name,
+        sender_username=sender_username,
+        message_text=message_text,
+        has_photo=has_photo,
+        message_id=message_id,
+        date_text=date_text,
+        time_text=time_text,
+        created_at=created_at
     )
 
-    personal_chat_id = get_config("personal_chat_id")
-
-    if personal_chat_id:
-        alert_text = (
-            "New message\n\n"
-            f"Group: {group_name}\n"
-            f"Sender: {sender_name}\n"
-            f"Username: {sender_username or '-'}\n"
-            f"Text: {message_text or '[No text]'}\n"
-            f"Photo: {has_photo}\n"
-            f"Date: {date_text}\n"
-            f"Time: {time_text}"
-        )
-
-        for part in split_long_text(alert_text):
-            await context.bot.send_message(
-                chat_id=personal_chat_id,
-                text=part
-            )
+    # No alert.
+    # Bot only saves data silently.
 
 
 # =========================
-# WEEKLY REPORT
+# WEEKLY AUTO REPORT
 # =========================
 
 async def send_weekly_excel(context: ContextTypes.DEFAULT_TYPE):
@@ -530,26 +534,36 @@ async def send_weekly_excel(context: ContextTypes.DEFAULT_TYPE):
         print("No personal chat ID saved. Please send /setme to the bot.")
         return
 
-    rows = get_unsent_grouped_messages()
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    now = datetime.now(TIMEZONE)
+    start_datetime, end_datetime = get_weekly_auto_period(now)
+
+    rows = get_grouped_messages_between(start_datetime, end_datetime)
 
     if not rows:
         await context.bot.send_message(
             chat_id=personal_chat_id,
-            text=f"No new messages since last report: {today}"
+            text=(
+                "No messages found for weekly report.\n\n"
+                f"From: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"To: {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
         )
         return
 
-    file_name = create_excel_file(rows, "weekly")
+    file_name = create_excel_file(rows, report_type="weekly")
 
-    with open(file_name, "rb") as f:
+    caption = (
+        "Weekly Telegram group messages report\n\n"
+        f"From: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"To: {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    with open(file_name, "rb") as file:
         await context.bot.send_document(
             chat_id=personal_chat_id,
-            document=f,
-            caption=f"Weekly report: messages since last report until {today}"
+            document=file,
+            caption=caption
         )
-
-    update_last_report_at(rows)
 
 
 # =========================
@@ -570,7 +584,6 @@ def main():
     app.add_handler(CommandHandler("setme", setme))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("sendnow", sendnow))
-    app.add_handler(CommandHandler("resetlast", resetlast))
     app.add_handler(CommandHandler("help", help_command))
 
     app.add_handler(
@@ -590,7 +603,9 @@ def main():
     )
 
     print("Bot is running...")
-    print("Weekly Excel report will be sent every Thursday at 3 PM Cambodia time.")
+    print("No alerts will be sent when group messages arrive.")
+    print("Use /sendnow to get Excel from latest Thursday 3 PM until now.")
+    print("Automatic Excel report: every Thursday at 3 PM Cambodia time.")
 
     app.run_polling()
 
