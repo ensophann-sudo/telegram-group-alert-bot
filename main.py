@@ -132,22 +132,10 @@ def build_message_link(chat, message_id):
     except:
         return ""
 
-def split_long_text(text, max_length=3900):
-    parts = []
-    while len(text) > max_length:
-        split_at = text.rfind("\n", 0, max_length)
-        if split_at == -1:
-            split_at = max_length
-        parts.append(text[:split_at])
-        text = text[split_at:].strip()
-    if text:
-        parts.append(text)
-    return parts
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type == "private":
-        await update.message.reply_text(f"Hello Sophann!\n\nYour Chat ID: {chat.id}\n\nSend /setme to receive alerts.")
+        await update.message.reply_text(f"Hello Sophann!\n\nYour Chat ID: {chat.id}\n\nSend /setme to receive weekly reports.")
     else:
         await update.message.reply_text("Bot is active in this group.")
 
@@ -157,7 +145,7 @@ async def setme(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please use /setme in private chat.")
         return
     set_config("personal_chat_id", str(chat.id))
-    await update.message.reply_text("Done! You will receive alerts and weekly Excel reports every Thursday at 3 PM Cambodia time.")
+    await update.message.reply_text("Done! You will receive weekly Excel reports every Thursday at 3 PM Cambodia time.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     personal_chat_id = get_config("personal_chat_id")
@@ -179,6 +167,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect messages from group without sending alerts"""
     message = update.message
     if not message:
         return
@@ -197,19 +186,9 @@ async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TY
     time_text = now.strftime("%H:%M:%S")
     created_at = now.isoformat()
     
-    # Save to database
+    # Save to database (no alert sent)
     save_message(group_id, group_name, sender_name, sender_username, message_text, has_photo, message_id, message_link, date_text, time_text, created_at)
-    
-    # Send alert to personal chat
-    personal_chat_id = get_config("personal_chat_id")
-    if personal_chat_id:
-        alert_text = f"🔔 New message\n\nGroup: {group_name}\nSender: {sender_name}\nUsername: {sender_username or '-'}\nText: {message_text or '[No text]'}\nPhoto: {has_photo}\nDate: {date_text}\nTime: {time_text}"
-        try:
-            for part in split_long_text(alert_text):
-                await context.bot.send_message(chat_id=personal_chat_id, text=part)
-            print(f"Alert sent for message from {sender_name} in {group_name}")
-        except Exception as e:
-            print(f"Error sending alert: {e}")
+    print(f"Message saved from {sender_name} in {group_name}")
 
 async def send_weekly_excel(context: ContextTypes.DEFAULT_TYPE):
     personal_chat_id = get_config("personal_chat_id")
@@ -248,7 +227,7 @@ def main():
     app.add_handler(CommandHandler("sendnow", sendnow))
     app.add_handler(CommandHandler("help", help_command))
     
-    # Message handler for group messages
+    # Message handler for group messages (collects silently, no alerts)
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & (filters.TEXT | filters.PHOTO) & ~filters.COMMAND, 
         collect_group_message
@@ -264,7 +243,7 @@ def main():
     
     print("Bot is running...")
     print("Weekly Excel report will be sent every Thursday at 3 PM Cambodia time")
-    print("Alerts will be sent when someone posts in the group")
+    print("Messages are collected silently (no alerts)")
     app.run_polling()
 
 if __name__ == "__main__":
