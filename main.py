@@ -85,30 +85,97 @@ def get_last_7_days_messages():
     SELECT group_name, sender_name, sender_username, message_text, has_photo, date_text, time_text, message_id, group_id, message_link
     FROM messages 
     WHERE created_at >= ? 
-    ORDER BY created_at ASC
+    ORDER BY date_text ASC, time_text ASC
     """, (seven_days_ago.isoformat(),))
     rows = cur.fetchall()
     conn.close()
     return rows
 
+def group_messages_by_datetime(rows):
+    """Group messages by date + HH:MM:SS and aggregate photos"""
+    grouped = {}
+    
+    for row in rows:
+        group_name, sender_name, sender_username, message_text, has_photo, date_text, time_text, message_id, group_id, message_link = row
+        
+        # Create key from date + HH:MM:SS (ignore seconds for grouping)
+        time_key = time_text[:8]  # HH:MM:SS
+        datetime_key = f"{date_text}_{time_key}"
+        
+        if datetime_key not in grouped:
+            grouped[datetime_key] = {
+                'group_name': group_name,
+                'sender_name': sender_name,
+                'sender_username': sender_username,
+                'messages': [],
+                'photo_count': 0,
+                'date_text': date_text,
+                'time_text': time_key,
+                'message_id': message_id,
+                'group_id': group_id,
+                'message_link': message_link
+            }
+        
+        # Add message text
+        if message_text:
+            grouped[datetime_key]['messages'].append(message_text)
+        
+        # Count photos
+        if has_photo == "Yes":
+            grouped[datetime_key]['photo_count'] += 1
+    
+    return grouped
+
 def create_excel_file(rows):
     now = datetime.now(TIMEZONE)
     file_name = f"telegram_group_messages_{now.strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
+    
+    # Group messages by datetime
+    grouped = group_messages_by_datetime(rows)
+    
     wb = Workbook()
     ws = wb.active
     ws.title = "Telegram Messages"
-    headers = ["Name Group", "Name Sender", "Username", "Text", "Photo", "Date", "Time", "Message ID", "Group ID", "Message Link"]
+    headers = ["Name Group", "Name Sender", "Username", "Text", "Photo", "Photo Qty", "Date", "Time", "Message ID", "Group ID", "Message Link"]
     ws.append(headers)
     header_fill = PatternFill(start_color="D9EAF7", end_color="D9EAF7", fill_type="solid")
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
-    for row in rows:
+    
+    # Add grouped rows
+    for datetime_key in sorted(grouped.keys()):
+        group_data = grouped[datetime_key]
+        
+        # Combine messages
+        combined_text = ", ".join(group_data['messages']) if group_data['messages'] else ""
+        
+        # Determine photo status
+        photo_status = "Yes" if group_data['photo_count'] > 0 else "No"
+        photo_qty = group_data['photo_count'] if group_data['photo_count'] > 0 else ""
+        
+        row = [
+            group_data['group_name'],
+            group_data['sender_name'],
+            group_data['sender_username'],
+            combined_text,
+            photo_status,
+            photo_qty,
+            group_data['date_text'],
+            group_data['time_text'],
+            group_data['message_id'],
+            group_data['group_id'],
+            group_data['message_link']
+        ]
         ws.append(row)
+    
+    # Format cells
     for row in ws.iter_rows():
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
+    
+    # Set column widths
     for column in ws.columns:
         max_length = 0
         column_letter = column[0].column_letter
@@ -116,6 +183,7 @@ def create_excel_file(rows):
             if cell.value:
                 max_length = max(max_length, len(str(cell.value)))
         ws.column_dimensions[column_letter].width = min(max_length + 2, 60)
+    
     ws.freeze_panes = "A2"
     wb.save(file_name)
     return file_name
