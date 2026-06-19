@@ -35,6 +35,7 @@ def init_db():
         message_text TEXT,
         has_photo TEXT,
         message_id TEXT,
+        message_link TEXT,
         date_text TEXT,
         time_text TEXT,
         created_at TEXT
@@ -75,9 +76,23 @@ def get_config(key):
 
     conn.close()
 
-    if row:
-        return row[0]
-    return None
+    return row[0] if row else None
+
+
+def build_message_link(chat, message_id):
+    try:
+        if chat.username:
+            return f"https://t.me/{chat.username}/{message_id}"
+
+        chat_id = str(chat.id)
+
+        if chat_id.startswith("-100"):
+            internal_id = chat_id.replace("-100", "")
+            return f"https://t.me/c/{internal_id}/{message_id}"
+
+        return ""
+    except Exception:
+        return ""
 
 
 def save_message(
@@ -88,6 +103,7 @@ def save_message(
     message_text,
     has_photo,
     message_id,
+    message_link,
     date_text,
     time_text,
     created_at
@@ -104,11 +120,12 @@ def save_message(
         message_text,
         has_photo,
         message_id,
+        message_link,
         date_text,
         time_text,
         created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         group_id,
         group_name,
@@ -117,6 +134,7 @@ def save_message(
         message_text,
         has_photo,
         message_id,
+        message_link,
         date_text,
         time_text,
         created_at
@@ -126,7 +144,7 @@ def save_message(
     conn.close()
 
 
-def get_last_7_days_messages():
+def get_messages_last_7_days():
     now = datetime.now(TIMEZONE)
     seven_days_ago = now - timedelta(days=7)
 
@@ -154,19 +172,62 @@ def get_last_7_days_messages():
     return rows
 
 
+def get_all_latest_messages():
+    """
+    If there are no messages in the last 7 days,
+    send all saved latest data from database.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+    SELECT
+        group_name,
+        sender_name,
+        sender_username,
+        message_text,
+        has_photo,
+        date_text,
+        time_text,
+        created_at
+    FROM messages
+    ORDER BY created_at ASC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return rows
+
+
+def get_report_messages():
+    """
+    Main report logic:
+    1. Try to get messages from last 7 days.
+    2. If no messages in last 7 days, get all saved latest data.
+    """
+    rows = get_messages_last_7_days()
+
+    if rows:
+        return rows, "last 7 days"
+
+    rows = get_all_latest_messages()
+
+    if rows:
+        return rows, "all saved latest data"
+
+    return [], "no data"
+
+
 def group_messages_by_same_datetime(rows):
     """
-    Group messages by:
-    Name Group + Name Sender + Username + Date + Time HH:MM:SS
+    Group by:
+    Group + Sender + Username + Date + Time HH:MM:SS
 
-    If text and photos are sent in the same date and same time HH:MM:SS,
-    they will become only one row in Excel.
+    If text and photos are sent at the same date/time HH:MM:SS,
+    they will show only one row in Excel.
 
-    Photo column will show quantity:
-    No
-    1 photo
-    2 photos
-    3 photos
+    Photo column shows photo quantity.
     """
     grouped = {}
 
@@ -182,28 +243,29 @@ def group_messages_by_same_datetime(rows):
             created_at
         ) = row
 
-        time_hhmmss = time_text[:8]
-        full_date_time = f"{date_text} {time_hhmmss}"
+        time_hhmmss = str(time_text)[:8]
+        date_time_text = f"{date_text} {time_hhmmss}"
 
         key = (
-            group_name,
-            sender_name,
-            sender_username,
-            full_date_time
+            group_name or "",
+            sender_name or "",
+            sender_username or "",
+            date_time_text
         )
 
         if key not in grouped:
             grouped[key] = {
-                "group_name": group_name,
-                "sender_name": sender_name,
-                "sender_username": sender_username,
+                "group_name": group_name or "",
+                "sender_name": sender_name or "",
+                "sender_username": sender_username or "",
                 "texts": [],
                 "photo_count": 0,
-                "date": full_date_time
+                "date": date_time_text,
+                "created_at": created_at or date_time_text
             }
 
         if message_text:
-            grouped[key]["texts"].append(message_text)
+            grouped[key]["texts"].append(str(message_text))
 
         if has_photo == "Yes":
             grouped[key]["photo_count"] += 1
@@ -221,6 +283,7 @@ def create_excel_file(rows):
     ws = wb.active
     ws.title = "Telegram Messages"
 
+    # Correct table headers only
     headers = [
         "Name Group",
         "Name Sender",
@@ -243,12 +306,16 @@ def create_excel_file(rows):
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    for key in sorted(grouped.keys(), key=lambda x: x[3]):
-        data = grouped[key]
+    sorted_items = sorted(
+        grouped.values(),
+        key=lambda x: x["created_at"]
+    )
 
+    for data in sorted_items:
         combined_text = "\n".join(data["texts"]) if data["texts"] else ""
 
         photo_count = data["photo_count"]
+
         if photo_count == 0:
             photo_text = "No"
         elif photo_count == 1:
@@ -278,9 +345,7 @@ def create_excel_file(rows):
 
         for cell in column:
             if cell.value:
-                value_length = len(str(cell.value))
-                if value_length > max_length:
-                    max_length = value_length
+                max_length = max(max_length, len(str(cell.value)))
 
         ws.column_dimensions[column_letter].width = min(max_length + 2, 60)
 
@@ -297,8 +362,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Hello Sophann!\n\n"
             f"Your Chat ID: {chat.id}\n\n"
-            f"Send /setme to save your chat ID for weekly Friday 4 PM report.\n"
-            f"Send /sendnow to get Excel immediately."
+            f"Use /setme to save this chat for auto report.\n"
+            f"Use /sendnow to receive Excel immediately."
         )
     else:
         await update.message.reply_text("Bot is active in this group.")
@@ -315,28 +380,30 @@ async def setme(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Done! Your chat ID is saved.\n"
-        "You will receive Excel report every Friday at 4 PM Cambodia time."
+        "Auto Excel report will be sent every Friday at 4 PM Cambodia time."
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     personal_chat_id = get_config("personal_chat_id")
-    rows = get_last_7_days_messages()
+    last_7_rows = get_messages_last_7_days()
+    all_rows = get_all_latest_messages()
 
     await update.message.reply_text(
         "Bot Status\n\n"
         f"Chat ID saved: {'Yes' if personal_chat_id else 'No'}\n"
-        f"Messages in last 7 days: {len(rows)}\n"
+        f"Messages in last 7 days: {len(last_7_rows)}\n"
+        f"All saved messages: {len(all_rows)}\n"
         "Auto report: Every Friday at 4 PM Cambodia time\n"
-        "Excel columns: Name Group, Name Sender, Username, Text, Photo, Date"
+        "Excel table: Name Group, Name Sender, Username, Text, Photo, Date"
     )
 
 
 async def sendnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = get_last_7_days_messages()
+    rows, report_type = get_report_messages()
 
     if not rows:
-        await update.message.reply_text("No messages in the last 7 days.")
+        await update.message.reply_text("No saved data in database yet.")
         return
 
     file_name = create_excel_file(rows)
@@ -345,7 +412,11 @@ async def sendnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=f,
-            caption=f"Excel report sent now.\nMessages collected: {len(rows)}"
+            caption=(
+                f"Excel report sent now.\n"
+                f"Report data: {report_type}\n"
+                f"Saved records used: {len(rows)}"
+            )
         )
 
 
@@ -382,6 +453,7 @@ async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TY
     message_text = message.text or message.caption or ""
     has_photo = "Yes" if message.photo else "No"
     message_id = str(message.message_id)
+    message_link = build_message_link(chat, message.message_id)
 
     date_text = now.strftime("%Y-%m-%d")
     time_text = now.strftime("%H:%M:%S")
@@ -395,6 +467,7 @@ async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TY
         message_text=message_text,
         has_photo=has_photo,
         message_id=message_id,
+        message_link=message_link,
         date_text=date_text,
         time_text=time_text,
         created_at=created_at
@@ -414,12 +487,12 @@ async def send_weekly_excel(context: ContextTypes.DEFAULT_TYPE):
         print("No personal chat ID saved. Please send /setme to the bot in private chat.")
         return
 
-    rows = get_last_7_days_messages()
+    rows, report_type = get_report_messages()
 
     if not rows:
         await context.bot.send_message(
             chat_id=personal_chat_id,
-            text=f"No messages in the last 7 days.\nChecked: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+            text=f"No saved data in database yet.\nChecked: {now.strftime('%Y-%m-%d %H:%M:%S')}"
         )
         return
 
@@ -432,7 +505,8 @@ async def send_weekly_excel(context: ContextTypes.DEFAULT_TYPE):
             caption=(
                 "Weekly Telegram Excel Report\n"
                 f"Auto sent: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Messages collected: {len(rows)}"
+                f"Report data: {report_type}\n"
+                f"Saved records used: {len(rows)}"
             )
         )
 
@@ -463,11 +537,7 @@ def main():
     ))
 
     # Auto send every Friday at 4:00 PM Cambodia time
-    # Monday = 0
-    # Tuesday = 1
-    # Wednesday = 2
-    # Thursday = 3
-    # Friday = 4
+    # Monday = 0, Tuesday = 1, Wednesday = 2, Thursday = 3, Friday = 4
     app.job_queue.run_daily(
         send_weekly_excel,
         time=time(hour=16, minute=0, second=0, tzinfo=TIMEZONE),
@@ -478,6 +548,8 @@ def main():
     print("Bot is running...")
     print("Auto Excel report: Every Friday at 4 PM Cambodia time.")
     print("Use /sendnow to send Excel immediately.")
+    print("If no data in last 7 days, bot will send all saved latest data.")
+    print("Excel columns: Name Group, Name Sender, Username, Text, Photo, Date")
     print("Collecting group messages silently...")
 
     app.run_polling()
