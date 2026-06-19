@@ -16,13 +16,36 @@ from telegram.ext import (
 )
 
 
+# =========================
+# CONFIG
+# =========================
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
 TIMEZONE = ZoneInfo("Asia/Phnom_Penh")
-DB_FILE = "telegram_group_messages.db"
+
+# For local: telegram_group_messages.db
+# For Render persistent disk, set env:
+# DB_FILE=/var/data/telegram_group_messages.db
+DB_FILE = os.getenv("DB_FILE", "telegram_group_messages.db")
+
+
+# =========================
+# DATABASE
+# =========================
+
+def get_db_connection():
+    db_dir = os.path.dirname(DB_FILE)
+
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    conn = sqlite3.connect(DB_FILE)
+    return conn
 
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute("""
@@ -54,7 +77,7 @@ def init_db():
 
 
 def set_config(key, value):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute("""
@@ -68,7 +91,7 @@ def set_config(key, value):
 
 
 def get_config(key):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute("SELECT value FROM config WHERE key = ?", (key,))
@@ -77,22 +100,6 @@ def get_config(key):
     conn.close()
 
     return row[0] if row else None
-
-
-def build_message_link(chat, message_id):
-    try:
-        if chat.username:
-            return f"https://t.me/{chat.username}/{message_id}"
-
-        chat_id = str(chat.id)
-
-        if chat_id.startswith("-100"):
-            internal_id = chat_id.replace("-100", "")
-            return f"https://t.me/c/{internal_id}/{message_id}"
-
-        return ""
-    except Exception:
-        return ""
 
 
 def save_message(
@@ -108,7 +115,7 @@ def save_message(
     time_text,
     created_at
 ):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute("""
@@ -144,11 +151,35 @@ def save_message(
     conn.close()
 
 
+# =========================
+# MESSAGE LINK
+# =========================
+
+def build_message_link(chat, message_id):
+    try:
+        if chat.username:
+            return f"https://t.me/{chat.username}/{message_id}"
+
+        chat_id = str(chat.id)
+
+        if chat_id.startswith("-100"):
+            internal_id = chat_id.replace("-100", "")
+            return f"https://t.me/c/{internal_id}/{message_id}"
+
+        return ""
+    except Exception:
+        return ""
+
+
+# =========================
+# REPORT DATA
+# =========================
+
 def get_messages_last_7_days():
     now = datetime.now(TIMEZONE)
     seven_days_ago = now - timedelta(days=7)
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute("""
@@ -175,9 +206,9 @@ def get_messages_last_7_days():
 def get_all_latest_messages():
     """
     If there are no messages in the last 7 days,
-    send all saved latest data from database.
+    send all saved data from database.
     """
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute("""
@@ -204,7 +235,7 @@ def get_report_messages():
     """
     Main report logic:
     1. Try to get messages from last 7 days.
-    2. If no messages in last 7 days, get all saved latest data.
+    2. If no messages in last 7 days, get all saved data.
     """
     rows = get_messages_last_7_days()
 
@@ -273,6 +304,10 @@ def group_messages_by_same_datetime(rows):
     return grouped
 
 
+# =========================
+# EXCEL
+# =========================
+
 def create_excel_file(rows):
     now = datetime.now(TIMEZONE)
     file_name = f"telegram_group_messages_{now.strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
@@ -283,7 +318,6 @@ def create_excel_file(rows):
     ws = wb.active
     ws.title = "Telegram Messages"
 
-    # Correct table headers only
     headers = [
         "Name Group",
         "Name Sender",
@@ -355,15 +389,28 @@ def create_excel_file(rows):
     return file_name
 
 
+def safe_delete_file(file_name):
+    try:
+        if file_name and os.path.exists(file_name):
+            os.remove(file_name)
+    except Exception as e:
+        print(f"Could not delete file {file_name}: {e}")
+
+
+# =========================
+# BOT COMMANDS
+# =========================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
     if chat.type == "private":
         await update.message.reply_text(
-            f"Hello Sophann!\n\n"
+            "Hello Sophann!\n\n"
             f"Your Chat ID: {chat.id}\n\n"
-            f"Use /setme to save this chat for auto report.\n"
-            f"Use /sendnow to receive Excel immediately."
+            "Use /setme to save this chat for auto report.\n"
+            "Use /sendnow to receive Excel immediately.\n"
+            "Use /status to check bot status."
         )
     else:
         await update.message.reply_text("Bot is active in this group.")
@@ -394,6 +441,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Chat ID saved: {'Yes' if personal_chat_id else 'No'}\n"
         f"Messages in last 7 days: {len(last_7_rows)}\n"
         f"All saved messages: {len(all_rows)}\n"
+        f"Database file: {DB_FILE}\n"
         "Auto report: Every Friday at 4 PM Cambodia time\n"
         "Excel table: Name Group, Name Sender, Username, Text, Photo, Date"
     )
@@ -406,18 +454,28 @@ async def sendnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No saved data in database yet.")
         return
 
-    file_name = create_excel_file(rows)
+    file_name = None
 
-    with open(file_name, "rb") as f:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=f,
-            caption=(
-                f"Excel report sent now.\n"
-                f"Report data: {report_type}\n"
-                f"Saved records used: {len(rows)}"
+    try:
+        file_name = create_excel_file(rows)
+
+        with open(file_name, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                caption=(
+                    "Excel report sent now.\n"
+                    f"Report data: {report_type}\n"
+                    f"Saved records used: {len(rows)}"
+                )
             )
-        )
+
+    except Exception as e:
+        await update.message.reply_text(f"Error creating or sending Excel file:\n{e}")
+        print(f"sendnow error: {e}")
+
+    finally:
+        safe_delete_file(file_name)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,6 +487,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - Show help"
     )
 
+
+# =========================
+# COLLECT GROUP MESSAGES
+# =========================
 
 async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -459,25 +521,33 @@ async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TY
     time_text = now.strftime("%H:%M:%S")
     created_at = now.isoformat()
 
-    save_message(
-        group_id=group_id,
-        group_name=group_name,
-        sender_name=sender_name,
-        sender_username=sender_username,
-        message_text=message_text,
-        has_photo=has_photo,
-        message_id=message_id,
-        message_link=message_link,
-        date_text=date_text,
-        time_text=time_text,
-        created_at=created_at
-    )
+    try:
+        save_message(
+            group_id=group_id,
+            group_name=group_name,
+            sender_name=sender_name,
+            sender_username=sender_username,
+            message_text=message_text,
+            has_photo=has_photo,
+            message_id=message_id,
+            message_link=message_link,
+            date_text=date_text,
+            time_text=time_text,
+            created_at=created_at
+        )
 
-    print(
-        f"Saved | Group: {group_name} | Sender: {sender_name} | "
-        f"Photo: {has_photo} | Date: {date_text} {time_text}"
-    )
+        print(
+            f"Saved | Group: {group_name} | Sender: {sender_name} | "
+            f"Photo: {has_photo} | Date: {date_text} {time_text}"
+        )
 
+    except Exception as e:
+        print(f"Error saving message: {e}")
+
+
+# =========================
+# WEEKLY AUTO REPORT
+# =========================
 
 async def send_weekly_excel(context: ContextTypes.DEFAULT_TYPE):
     personal_chat_id = get_config("personal_chat_id")
@@ -496,22 +566,51 @@ async def send_weekly_excel(context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    file_name = create_excel_file(rows)
+    file_name = None
 
-    with open(file_name, "rb") as f:
-        await context.bot.send_document(
-            chat_id=personal_chat_id,
-            document=f,
-            caption=(
-                "Weekly Telegram Excel Report\n"
-                f"Auto sent: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Report data: {report_type}\n"
-                f"Saved records used: {len(rows)}"
+    try:
+        file_name = create_excel_file(rows)
+
+        with open(file_name, "rb") as f:
+            await context.bot.send_document(
+                chat_id=personal_chat_id,
+                document=f,
+                caption=(
+                    "Weekly Telegram Excel Report\n"
+                    f"Auto sent: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Report data: {report_type}\n"
+                    f"Saved records used: {len(rows)}"
+                )
             )
-        )
 
-    print(f"Weekly Excel report sent at {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Weekly Excel report sent at {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
+    except Exception as e:
+        print(f"Weekly report error: {e}")
+
+        try:
+            await context.bot.send_message(
+                chat_id=personal_chat_id,
+                text=f"Error sending weekly Excel report:\n{e}"
+            )
+        except Exception as send_error:
+            print(f"Could not send error message: {send_error}")
+
+    finally:
+        safe_delete_file(file_name)
+
+
+# =========================
+# ERROR HANDLER
+# =========================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Bot error: {context.error}")
+
+
+# =========================
+# MAIN
+# =========================
 
 def main():
     if not BOT_TOKEN:
@@ -536,20 +635,31 @@ def main():
         collect_group_message
     ))
 
+    app.add_error_handler(error_handler)
+
     # Auto send every Friday at 4:00 PM Cambodia time
-    # Monday = 0, Tuesday = 1, Wednesday = 2, Thursday = 3, Friday = 4
-    app.job_queue.run_daily(
-        send_weekly_excel,
-        time=time(hour=16, minute=0, second=0, tzinfo=TIMEZONE),
-        days=(4,),
-        name="weekly_excel_friday_4pm"
-    )
+    # Monday = 0
+    # Tuesday = 1
+    # Wednesday = 2
+    # Thursday = 3
+    # Friday = 4
+    if app.job_queue:
+        app.job_queue.run_daily(
+            send_weekly_excel,
+            time=time(hour=16, minute=0, second=0, tzinfo=TIMEZONE),
+            days=(4,),
+            name="weekly_excel_friday_4pm"
+        )
+    else:
+        print("WARNING: JobQueue is not available.")
+        print('Install with: pip install "python-telegram-bot[job-queue]"')
 
     print("Bot is running...")
     print("Auto Excel report: Every Friday at 4 PM Cambodia time.")
     print("Use /sendnow to send Excel immediately.")
     print("If no data in last 7 days, bot will send all saved latest data.")
     print("Excel columns: Name Group, Name Sender, Username, Text, Photo, Date")
+    print(f"Database file: {DB_FILE}")
     print("Collecting group messages silently...")
 
     app.run_polling()
