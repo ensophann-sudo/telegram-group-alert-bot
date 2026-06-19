@@ -21,11 +21,12 @@ from telegram.ext import (
 # =========================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
 TIMEZONE = ZoneInfo("Asia/Phnom_Penh")
 
-# For local: telegram_group_messages.db
-# For Render persistent disk, set env:
+# Local default:
+# telegram_group_messages.db
+#
+# For Render persistent disk, set environment variable:
 # DB_FILE=/var/data/telegram_group_messages.db
 DB_FILE = os.getenv("DB_FILE", "telegram_group_messages.db")
 
@@ -176,6 +177,9 @@ def build_message_link(chat, message_id):
 # =========================
 
 def get_messages_last_7_days():
+    """
+    Get messages from last 7 days only.
+    """
     now = datetime.now(TIMEZONE)
     seven_days_ago = now - timedelta(days=7)
 
@@ -203,10 +207,12 @@ def get_messages_last_7_days():
     return rows
 
 
-def get_all_latest_messages():
+def get_latest_saved_messages(limit=1000):
     """
-    If there are no messages in the last 7 days,
-    send all saved data from database.
+    If no messages exist in the last 7 days,
+    get latest saved messages from database.
+
+    Default: latest 1000 saved records.
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -222,32 +228,49 @@ def get_all_latest_messages():
         time_text,
         created_at
     FROM messages
-    ORDER BY created_at ASC
-    """)
+    ORDER BY created_at DESC
+    LIMIT ?
+    """, (limit,))
 
     rows = cur.fetchall()
     conn.close()
 
+    # Reverse to show old -> new in Excel
+    rows.reverse()
+
     return rows
+
+
+def get_all_message_count():
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM messages")
+    count = cur.fetchone()[0]
+
+    conn.close()
+
+    return count
 
 
 def get_report_messages():
     """
-    Main report logic:
-    1. Try to get messages from last 7 days.
-    2. If no messages in last 7 days, get all saved data.
+    Report logic:
+    1. If messages exist in last 7 days, send last 7 days data.
+    2. If no messages in last 7 days, send latest saved data.
+    3. If database is empty, return no data.
     """
     rows = get_messages_last_7_days()
 
     if rows:
-        return rows, "last 7 days"
+        return rows, "messages from last 7 days"
 
-    rows = get_all_latest_messages()
+    rows = get_latest_saved_messages()
 
     if rows:
-        return rows, "all saved latest data"
+        return rows, "no new messages in last 7 days, sent latest saved data"
 
-    return [], "no data"
+    return [], "no saved data"
 
 
 def group_messages_by_same_datetime(rows):
@@ -434,16 +457,21 @@ async def setme(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     personal_chat_id = get_config("personal_chat_id")
     last_7_rows = get_messages_last_7_days()
-    all_rows = get_all_latest_messages()
+    latest_rows = get_latest_saved_messages()
+    total_count = get_all_message_count()
 
     await update.message.reply_text(
         "Bot Status\n\n"
         f"Chat ID saved: {'Yes' if personal_chat_id else 'No'}\n"
         f"Messages in last 7 days: {len(last_7_rows)}\n"
-        f"All saved messages: {len(all_rows)}\n"
-        f"Database file: {DB_FILE}\n"
+        f"Latest saved records available: {len(latest_rows)}\n"
+        f"Total saved messages: {total_count}\n"
+        f"Database file: {DB_FILE}\n\n"
         "Auto report: Every Friday at 4 PM Cambodia time\n"
-        "Excel table: Name Group, Name Sender, Username, Text, Photo, Date"
+        "Excel table: Name Group, Name Sender, Username, Text, Photo, Date\n\n"
+        "Report rule:\n"
+        "1. Send last 7 days data if available.\n"
+        "2. If no new data in last 7 days, send latest saved data."
     )
 
 
@@ -500,7 +528,12 @@ async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     chat = update.effective_chat
     user = update.effective_user
-    now = datetime.now(TIMEZONE)
+
+    # Use Telegram message time converted to Cambodia time
+    if message.date:
+        message_datetime = message.date.astimezone(TIMEZONE)
+    else:
+        message_datetime = datetime.now(TIMEZONE)
 
     group_id = str(chat.id)
     group_name = chat.title or "Unknown Group"
@@ -517,9 +550,9 @@ async def collect_group_message(update: Update, context: ContextTypes.DEFAULT_TY
     message_id = str(message.message_id)
     message_link = build_message_link(chat, message.message_id)
 
-    date_text = now.strftime("%Y-%m-%d")
-    time_text = now.strftime("%H:%M:%S")
-    created_at = now.isoformat()
+    date_text = message_datetime.strftime("%Y-%m-%d")
+    time_text = message_datetime.strftime("%H:%M:%S")
+    created_at = message_datetime.isoformat()
 
     try:
         save_message(
@@ -657,7 +690,7 @@ def main():
     print("Bot is running...")
     print("Auto Excel report: Every Friday at 4 PM Cambodia time.")
     print("Use /sendnow to send Excel immediately.")
-    print("If no data in last 7 days, bot will send all saved latest data.")
+    print("If no data in last 7 days, bot will send latest saved data.")
     print("Excel columns: Name Group, Name Sender, Username, Text, Photo, Date")
     print(f"Database file: {DB_FILE}")
     print("Collecting group messages silently...")
